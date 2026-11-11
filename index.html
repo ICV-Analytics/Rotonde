@@ -1,0 +1,1078 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rotonde Stappenplan</title>
+<style>
+:root{--bg:#0e1117;--panel:#171b24;--line:#2a3142;--fg:#e8ecf3;--muted:#8a93a6;--acc:#ffb020}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%;background:var(--bg);color:var(--fg);font-family:"Segoe UI",system-ui,-apple-system,Roboto,Arial,sans-serif}
+body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:12px 16px;min-height:100vh}
+.wrap{width:min(100%, calc((100vh - 90px) * 16 / 9))}
+#stage{position:relative;width:100%;aspect-ratio:16/9;border-radius:12px;overflow:hidden;box-shadow:0 10px 40px rgba(0,0,0,.55);background:#000}
+canvas{display:block;width:100%;height:100%}
+#bar{display:flex;align-items:center;gap:8px;margin-top:10px;flex-wrap:wrap}
+button,select{background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:7px 12px;font:inherit;font-size:14px;cursor:pointer}
+button:hover,select:hover{border-color:var(--acc)}
+input[type=range]{flex:1;min-width:120px;accent-color:var(--acc)}
+#time{font-variant-numeric:tabular-nums;color:var(--muted);font-size:13px;min-width:96px;text-align:right}
+#chapters{display:flex;gap:6px;flex-wrap:wrap}
+#chapters button{font-size:12px;padding:5px 9px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div id="stage"><canvas id="cv"></canvas></div>
+  <div id="bar">
+    <button id="play">⏸ Pauze</button>
+    <button id="restart">↺ Opnieuw</button>
+    <input id="scrub" type="range" min="0" max="1000" value="0" step="1">
+    <span id="time">0:00 / 0:00</span>
+    <select id="rate"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.5">1.5×</option><option value="2">2×</option></select>
+  </div>
+  <div id="bar2" style="margin-top:6px"><div id="chapters"></div></div>
+</div>
+<script>
+'use strict';
+/* ============================================================
+   Rotonde-stappenplan — doorlopende educatieve animatie
+   Alles is een pure functie van de tijd t → scrubben werkt overal.
+   ============================================================ */
+const W = 1600, H = 900, MAINW = 1100;
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const PI = Math.PI, TAU = PI * 2;
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const ss = t => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
+const easeOutBack = t => { t = clamp(t, 0, 1); const c = 1.7; return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2); };
+const PX = 6;                       // pixels per meter in de wereld
+const KMH = v => v / PX * 3.6;      // px/s -> km/u
+const DEG = PI / 180;
+
+/* ---------- Keyframe-track (vloeiend geïnterpoleerd) ---------- */
+class Track {
+  constructor(v0 = 0) { this.k = [[-1e9, v0]]; }
+  at(t) {
+    const k = this.k;
+    if (t <= k[0][0]) return k[0][1];
+    for (let i = 1; i < k.length; i++) {
+      if (t < k[i][0]) {
+        const a = k[i - 1], b = k[i];
+        return lerp(a[1], b[1], ss((t - a[0]) / ((b[0] - a[0]) || 1)));
+      }
+    }
+    return k[k.length - 1][1];
+  }
+  // van huidige waarde op t0 naar v op t1
+  ramp(t0, t1, v) { const c = this.at(t0); this.k.push([t0, c], [t1, v]); this.k.sort((a, b) => a[0] - b[0]); return this; }
+}
+/* Event-lijst: items met t0/t1 die actief zijn in een interval */
+const active = (list, t) => list.filter(e => t >= e.t0 && t < e.t1);
+const fadeOf = (e, t, fi = 0.25, fo = 0.3) => Math.min(ss((t - e.t0) / fi), ss((e.t1 - t) / fo));
+
+/* ---------- Pad (gesampled, met booglengte) ---------- */
+class Path {
+  constructor(x, y) { this.p = [{ x, y, s: 0 }]; this.len = 0; this.marks = {}; this.arcs = {}; }
+  last() { return this.p[this.p.length - 1]; }
+  add(x, y) {
+    const q = this.last(), d = Math.hypot(x - q.x, y - q.y);
+    if (d < 1e-6) return;
+    this.len += d; this.p.push({ x, y, s: this.len });
+  }
+  line(x, y) {
+    const q = this.last(), d = Math.hypot(x - q.x, y - q.y), n = Math.max(1, Math.ceil(d / 4));
+    const qx = q.x, qy = q.y;
+    for (let i = 1; i <= n; i++) this.add(lerp(qx, x, i / n), lerp(qy, y, i / n));
+    return this;
+  }
+  bez(x1, y1, x2, y2, x3, y3) {
+    const q = this.last(), x0 = q.x, y0 = q.y;
+    for (let i = 1; i <= 60; i++) {
+      const t = i / 60, u = 1 - t;
+      this.add(u*u*u*x0 + 3*u*u*t*x1 + 3*u*t*t*x2 + t*t*t*x3, u*u*u*y0 + 3*u*u*t*y1 + 3*u*t*t*y2 + t*t*t*y3);
+    }
+    return this;
+  }
+  arc(cx, cy, r, a0, a1) {
+    const n = Math.max(2, Math.ceil(Math.abs(a1 - a0) * r / 3));
+    for (let i = 1; i <= n; i++) { const a = lerp(a0, a1, i / n); this.add(cx + r * Math.cos(a), cy + r * Math.sin(a)); }
+    return this;
+  }
+  mark(n) { this.marks[n] = this.len; return this; }
+  pt(s) {
+    const p = this.p; s = clamp(s, 0, this.len);
+    let lo = 0, hi = p.length - 1;
+    while (hi - lo > 1) { const m = (lo + hi) >> 1; if (p[m].s <= s) lo = m; else hi = m; }
+    const a = p[lo], b = p[hi], f = (s - a.s) / ((b.s - a.s) || 1);
+    return { x: lerp(a.x, b.x, f), y: lerp(a.y, b.y, f) };
+  }
+  pose(s) {
+    const c = this.pt(s), a = this.pt(s - 5), b = this.pt(s + 5);
+    return { x: c.x, y: c.y, a: Math.atan2(b.y - a.y, b.x - a.x) };
+  }
+  curv(s) {
+    const h0 = this.pose(s - 8).a, h1 = this.pose(s + 8).a;
+    let d = h1 - h0; while (d > PI) d -= TAU; while (d < -PI) d += TAU;
+    return d / 16;
+  }
+  nearest(x, y) {
+    let best = 1e18, bs = 0;
+    for (const q of this.p) { const d = (q.x - x) ** 2 + (q.y - y) ** 2; if (d < best) { best = d; bs = q.s; } }
+    return bs;
+  }
+  arcS(tag, th) { const a = this.arcs[tag]; return a.s0 + a.r * (a.te - th); }
+}
+
+/* ---------- Rotonde-geometrie ---------- */
+const LANE = 10.5;          // halve rijstrookbreedte (3.5 m)
+const RO = 108;             // buitenrand rijbaan rotonde (18 m)
+const RI = 60;              // middeneiland
+const RMID = 84;            // midden van de rijbaan
+const RC = RO + 56;         // hartlijn fietspad-ring
+const D_ZEBRA0 = RO + 30, D_ZEBRA1 = RO + 46;   // zebrapad
+const D_TEETH = RO + 66;                        // haaientanden vóór fietspad
+const D_ZONE = D_TEETH + 60;                    // ~10 meter zone
+const armU = phi => ({ x: Math.cos(phi), y: Math.sin(phi) });
+const inOff = u => ({ x: u.y, y: -u.x });       // inkomende rijstrook (rechts rijden)
+
+// rijdt het pad over rotonde C: binnenkomen via arm phiIn, verlaten via arm phiOut (tegen de klok in)
+function passRA(path, C, phiIn, phiOut, r, tag) {
+  const u = armU(phiIn), o = inOff(u), k = 34;
+  const p0 = { x: C.x + u.x * (RO + 8) + o.x * LANE, y: C.y + u.y * (RO + 8) + o.y * LANE };
+  path.line(p0.x, p0.y).mark(tag + 'E');
+  const te = phiIn - 0.5; let tx = phiOut + 0.5; while (tx >= te) tx -= TAU;
+  const P3 = { x: C.x + r * Math.cos(te), y: C.y + r * Math.sin(te) }, T3 = { x: Math.sin(te), y: -Math.cos(te) };
+  path.bez(p0.x - u.x * k, p0.y - u.y * k, P3.x - T3.x * k, P3.y - T3.y * k, P3.x, P3.y);
+  path.arcs[tag] = { C, r, te, tx, s0: path.len };
+  path.mark(tag + 'A0');
+  path.arc(C.x, C.y, r, te, tx);
+  path.mark(tag + 'A1');
+  const v = armU(phiOut), oo = { x: -v.y, y: v.x };
+  const Q0 = { x: C.x + r * Math.cos(tx), y: C.y + r * Math.sin(tx) }, TQ = { x: Math.sin(tx), y: -Math.cos(tx) };
+  const q3 = { x: C.x + v.x * (RO + 8) + oo.x * LANE, y: C.y + v.y * (RO + 8) + oo.y * LANE };
+  path.bez(Q0.x + TQ.x * k, Q0.y + TQ.y * k, q3.x - v.x * k, q3.y - v.y * k, q3.x, q3.y);
+  path.mark(tag + 'X');
+  return path;
+}
+
+/* ---------- Wereld ---------- */
+const L1 = 1300, L2 = 1500;
+const C1 = { x: 0, y: 0 }, C2 = { x: 0, y: -L1 }, C3 = { x: L2, y: -L1 };
+const N_ = -PI / 2, S_ = PI / 2, E_ = 0, W_ = PI;
+const RAS = [
+  { C: C1, arms: [[S_, 1500], [N_, 650], [E_, 800], [W_, 800]] },
+  { C: C2, arms: [[S_, 650], [E_, 750], [N_, 800], [W_, 800]] },
+  { C: C3, arms: [[W_, 750], [N_, 1900], [S_, 800], [E_, 800]] },
+];
+
+const route = new Path(C1.x + LANE, C1.y + 1400);
+passRA(route, C1, S_, N_, RMID, 'r1');     // situatie 1: rechtdoor
+passRA(route, C2, S_, E_, RMID, 'r2');     // situatie 2: rechtsaf
+passRA(route, C3, W_, N_, 76, 'r3');       // situatie 3: linksaf (binnenste lijn)
+route.line(C3.x + LANE, C3.y - 1850);
+
+// verkeer op drukke rotonde 1: van west naar oost (rechtdoor)
+const trafPath = passRA(new Path(C1.x - 900, C1.y - LANE), C1, W_, E_, RMID, 't');
+trafPath.line(C1.x + 900, C1.y + LANE);
+// een auto die bij rotonde 1 van noord komt en naar west gaat (wordt 'voorspeld')
+const trafPath2 = passRA(new Path(C1.x - LANE, C1.y - 600), C1, N_, W_, RMID, 'u');
+trafPath2.line(C1.x - 900, C1.y - LANE);
+
+// fietser bij rotonde 2: fietspad oostzijde, rechtdoor over de fietsring
+const bikePath = (() => {
+  const C = C2, p = new Path(C.x + 48, C.y + 1000);
+  const a0 = 1.05, P = { x: C.x + RC * Math.cos(a0), y: C.y + RC * Math.sin(a0) }, T = { x: Math.sin(a0), y: -Math.cos(a0) };
+  p.line(C.x + 48, C.y + 232);
+  p.bez(C.x + 48, C.y + 200, P.x - T.x * 30, P.y - T.y * 30, P.x, P.y);
+  const a1 = -1.05; p.arc(C.x, C.y, RC, a0, a1);
+  const Q = { x: C.x + RC * Math.cos(a1), y: C.y + RC * Math.sin(a1) }, TQ = { x: Math.sin(a1), y: -Math.cos(a1) };
+  p.bez(Q.x + TQ.x * 30, Q.y + TQ.y * 30, C.x + 48, C.y - 200, C.x + 48, C.y - 232);
+  p.line(C.x + 48, C.y - 900);
+  return p;
+})();
+
+/* bomen & huizen (seeded) */
+function rng(seed) { return () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; }; }
+function distSeg(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay, l = dx * dx + dy * dy;
+  const t = l ? clamp(((px - ax) * dx + (py - ay) * dy) / l, 0, 1) : 0;
+  return Math.hypot(px - ax - t * dx, py - ay - t * dy);
+}
+const ARMSEG = [];
+for (const ra of RAS) for (const [phi, len] of ra.arms) { const u = armU(phi); ARMSEG.push([ra.C.x + u.x * RO, ra.C.y + u.y * RO, ra.C.x + u.x * len, ra.C.y + u.y * len]); }
+function clearOf(x, y, m) {
+  for (const s of ARMSEG) if (distSeg(x, y, ...s) < m) return false;
+  for (const ra of RAS) if (Math.hypot(x - ra.C.x, y - ra.C.y) < RC + m - 20) return false;
+  return true;
+}
+const TREES = [], HOUSES = [];
+{
+  const r = rng(7);
+  for (let i = 0; i < 2600 && TREES.length < 520; i++) {
+    const x = lerp(-1000, 2400, r()), y = lerp(-3400, 1700, r());
+    if (clearOf(x, y, 78)) TREES.push({ x, y, r: 9 + r() * 10, h: r() });
+  }
+  for (let i = 0; i < 1500 && HOUSES.length < 60; i++) {
+    const x = lerp(-1000, 2400, r()), y = lerp(-3400, 1700, r());
+    if (!clearOf(x, y, 125)) continue;
+    if (HOUSES.some(h => Math.hypot(h.x - x, h.y - y) < 90)) continue;
+    HOUSES.push({ x, y, w: 40 + r() * 30, h: 34 + r() * 20, a: (r() < .5 ? 0 : PI / 2) + (r() - .5) * .1, c: r() });
+  }
+  for (let i = TREES.length - 1; i >= 0; i--) if (HOUSES.some(h => Math.hypot(h.x - TREES[i].x, h.y - TREES[i].y) < 50)) TREES.splice(i, 1);
+}
+
+/* ============================================================
+   TIJDLIJN — snelheidsprofiel via waypoints (constante versnelling)
+   ============================================================ */
+const M = route.marks, WP = [];
+const wp = (n, s, v) => WP.push({ n, s, v });
+const hold = (n, d) => WP.push({ n, hold: d });
+function approachWP(p, sE, vDecide) {
+  wp(p + '_start', sE - 820, 83);   // 50 km/u
+  wp(p + '_ind', sE - 600, 83);
+  wp(p + '_brake', sE - 500, 83);
+  wp(p + '_shift', sE - 340, 50);
+  wp(p + '_cup', sE - 250, 40);
+  wp(p + '_zone', sE - 130, 30);    // neus van de auto bij begin 10-meter zone
+  wp(p + '_decide', sE - 70, vDecide); // neus bij haaientanden: beslissen
+}
+// Situatie 1 — rechtdoor, druk
+approachWP('s1', M.r1E, 20);
+wp('s1_creep', M.r1E - 14, 4);
+wp('s1_go', M.r1E - 8, 4);
+wp('s1_in', M.r1A0 + 10, 30);
+wp('s1_ind6', route.arcS('r1', -0.12), 33);
+wp('s1_bs', route.arcS('r1', -0.8), 33);
+wp('s1_x', M.r1X, 36);
+wp('s1_out', M.r1X + 60, 50);
+// Situatie 2 — rechtsaf, fietser in de dode hoek
+approachWP('s2', M.r2E, 24);
+wp('s2_in', M.r2A0, 22);
+wp('s2_bs', M.r2A1 - 10, 22);
+wp('s2_brk', M.r2X - 24, 18);
+wp('s2_stop', M.r2X + 6, 0);
+hold('s2_wait', 3.4);
+wp('s2_out', M.r2X + 110, 45);
+// Situatie 3 — linksaf (driekwart), rustig
+approachWP('s3', M.r3E, 27);
+wp('s3_in', M.r3A0, 26);
+wp('s3_ind6', route.arcS('r3', -0.1), 26);
+wp('s3_bs', route.arcS('r3', -0.8), 26);
+wp('s3_x', M.r3X, 30);
+wp('s3_out', M.r3X + 80, 45);
+wp('s3_cruise', M.r3X + 520, 83);
+wp('s3_end', M.r3X + 1450, 83);
+
+const T = {}, SEG = [];
+let T_END = 0;
+{
+  let t = 0, prev = null;
+  for (const w of WP) {
+    if (w.hold) { SEG.push({ t0: t, t1: t + w.hold, s0: prev.s, v0: 0, a: 0 }); T[w.n] = t; t += w.hold; T[w.n + '_end'] = t; prev = { s: prev.s, v: 0 }; continue; }
+    if (prev) { const dt = 2 * (w.s - prev.s) / (prev.v + w.v); SEG.push({ t0: t, t1: t + dt, s0: prev.s, v0: prev.v, a: (w.v - prev.v) / dt }); t += dt; }
+    T[w.n] = t; prev = { s: w.s, v: w.v };
+  }
+  T_END = t;
+}
+function carSV(t) {
+  for (const g of SEG) if (t < g.t1) { const u = Math.max(0, t - g.t0); return { s: g.s0 + g.v0 * u + .5 * g.a * u * u, v: Math.max(0, g.v0 + g.a * u) }; }
+  const g = SEG[SEG.length - 1], u = g.t1 - g.t0; return { s: g.s0 + g.v0 * u + .5 * g.a * u * u, v: g.v0 + g.a * u };
+}
+
+/* 'Wat als?'-inzet: de hoofdtijd bevriest even (flashback) */
+const FREEZE = { t: T.s3_cup + 1.3, d: 8 };
+const TOTAL = T_END + FREEZE.d;
+const simT = G => G < FREEZE.t ? G : G < FREEZE.t + FREEZE.d ? FREEZE.t : G - FREEZE.d;
+const realT = t => t < FREEZE.t ? t : t + FREEZE.d;
+
+/* ---------- Bediening & gebeurtenissen ---------- */
+const gas = new Track(0.35), brake = new Track(0), clutch = new Track(0);
+const SHIFTS = [], IND = [], LOOKS = [], MIRR = [], POPS = [], STEPS = [], HANDS = [], ZONES = [], BANNERS = [], SHOULDER = [];
+const C_LOOK = '#ffd34d', C_MIR = '#4dd2ff', C_RED = '#ff4d4d', C_OK = '#3ddc84';
+function look(t0, dur, a0, a1, len, w, col, label, track) { LOOKS.push({ t0, t1: t0 + dur, a0: a0 * DEG, a1: a1 * DEG, len, w: w * DEG, col, label, track }); }
+function mirror(t0, dur, m, col = C_MIR) {
+  MIRR.push({ t0, t1: t0 + dur, m, col });
+  const a = { L: -162, C: 180, R: 162 }[m];
+  look(t0, dur, a, a, 230, 22, col);
+}
+function pop(t0, dur, title, sub, kind = 'step', slot = 0) { POPS.push({ t0, t1: t0 + dur, title, sub, kind, slot }); }
+function step(t, sit, n, state) { STEPS.push({ t, sit, n, state }); }
+function shift(t0, g0, g1, dur = 0.75) { SHIFTS.push({ t0, t1: t0 + dur, g0, g1 }); HANDS.push({ t0: t0 - 0.3, t1: t0 + dur + 0.3 }); }
+function indicator(t0, t1, dir) { IND.push({ t0, t1, dir }); }
+function upshift(t0, g0, g1, gasAfter = 0.35) {
+  gas.ramp(t0, t0 + 0.15, 0); clutch.ramp(t0, t0 + 0.2, 1);
+  shift(t0 + 0.2, g0, g1, 0.55);
+  clutch.ramp(t0 + 0.8, t0 + 1.25, 0); gas.ramp(t0 + 0.9, t0 + 1.3, gasAfter);
+}
+
+const SITS = [
+  { n: 1, p: 's1', title: 'Situatie 1', sub: 'Rechtdoor over een drukke rotonde', theme: 'Timing en invoegen', dir: null, C: C1, arm: S_ },
+  { n: 2, p: 's2', title: 'Situatie 2', sub: 'Rechtsaf met een fietser in de dode hoek', theme: 'Waarnemen en wachten', dir: 'R', C: C2, arm: S_ },
+  { n: 3, p: 's3', title: 'Situatie 3', sub: 'Linksaf (driekwart) in een rustige situatie', theme: 'Vloeiende rit', dir: 'L', C: C3, arm: W_ },
+];
+
+function approachEvents(S) {
+  const t = n => T[S.p + '_' + n], sit = S.n;
+  BANNERS.push({ t0: Math.max(0, t('start') - 1.2), t1: t('start') + 2.6, S });
+  ZONES.push({ t0: t('start') - 3, t1: t('decide') + 1.2, tz: t('zone'), C: S.C, arm: S.arm });
+  // 1. Kijkpatroon
+  const k = t('start') + 0.15;
+  mirror(k, 0.65, 'C'); mirror(k + 0.7, 0.65, 'L'); mirror(k + 1.4, 0.6, 'R');
+  look(k + 2.0, t('ind') - k - 1.9, 0, 0, 560, 14, C_LOOK, 'VER VOORUIT');
+  pop(k, t('ind') - k, '1. Kijkpatroon', 'Binnenspiegel · buitenspiegels · ver vooruit kijken');
+  step(k, sit, 1, 'active'); step(t('ind'), sit, 1, 'done');
+  // 2. Richtingaanwijzer
+  if (S.dir) {
+    indicator(t('ind') + 0.15, 1e9, S.dir);  // eindtijd wordt later gezet
+    mirror(t('ind') + 0.25, 0.6, S.dir);
+    pop(t('ind'), t('brake') - t('ind') + 0.3, '2. Richtingaanwijzer', S.dir === 'R' ? 'Rechts aan — je neemt de 1e afslag' : 'Links aan — je gaat driekwart rond');
+    step(t('ind'), sit, 2, 'active'); step(t('brake'), sit, 2, 'done');
+  } else {
+    pop(t('ind'), t('brake') - t('ind') + 0.3, '2. Richtingaanwijzer', 'Niet nodig — we gaan rechtdoor', 'skip');
+    step(t('ind'), sit, 2, 'skip');
+  }
+  // 3. Remmen (gas los)
+  gas.ramp(t('brake'), t('brake') + 0.3, 0);
+  brake.ramp(t('brake') + 0.25, t('brake') + 0.7, 0.45);
+  pop(t('brake'), t('shift') - t('brake'), '3. Remmen', '(gas los) — rustig snelheid minderen');
+  step(t('brake'), sit, 3, 'active'); step(t('shift'), sit, 3, 'done');
+  // 4. Schakelen -> 2
+  clutch.ramp(t('shift'), t('shift') + 0.3, 1);
+  brake.ramp(t('shift'), t('shift') + 0.3, 0.3);
+  shift(t('shift') + 0.35, 3, 2, 0.75);
+  pop(t('shift'), t('cup') - t('shift'), '4. Schakelen → 2', 'Koppeling in · pook van 3 naar 2');
+  step(t('shift'), sit, 4, 'active'); step(t('cup'), sit, 4, 'done');
+  // 5. Koppeling omhoog
+  clutch.ramp(t('cup'), t('cup') + 0.5, 0.55);
+  clutch.ramp(t('cup') + 0.65, t('cup') + 1.3, 0);
+  brake.ramp(t('cup'), t('cup') + 0.5, 0.15);
+  pop(t('cup'), t('zone') - t('cup'), '5. Koppeling omhoog', 'Rustig laten opkomen — de auto rolt in z\'n 2');
+  step(t('cup'), sit, 5, 'active'); step(t('zone'), sit, 5, 'done');
+  pop(t('zone'), t('decide') - t('zone') + 0.2, 'Klaar zijn met bediening!', 'Vanaf hier alleen nog kijken en beslissen', 'key');
+  pop(t('zone') + 0.3, t('decide') - t('zone'), 'Kijk beide kanten', 'links · rechts', 'look', 1);
+  const zd = t('decide') - t('zone');
+  look(t('zone') + 0.05, zd * 0.4, -35, -100, 330, 28, C_LOOK, 'LINKS');
+  look(t('zone') + zd * 0.42, zd * 0.36, 35, 100, 330, 28, C_LOOK, 'RECHTS');
+  look(t('zone') + zd * 0.8, zd * 0.45, -60, -85, 330, 26, C_LOOK, 'LINKS');
+}
+SITS.forEach(approachEvents);
+const setIndEnd = (dir, t1) => { for (const e of IND) if (e.t1 > 1e8 && e.dir === dir) e.t1 = t1; };
+
+/* ---- Situatie 1: drukke rotonde, gat voorspellen ---- */
+{
+  const t = n => T['s1_' + n];
+  pop(t('decide'), 1.4, 'Beslissen', 'Druk! Verkeer van links heeft voorrang', 'decide');
+  brake.ramp(t('decide'), t('creep'), 0.32);
+  clutch.ramp(t('decide') + 0.2, t('decide') + 1.0, 0.55);
+  pop(t('decide') + 1.4, t('go') - t('decide') - 1.4, 'Gat voorspellen…', 'Koppeling op het aangrijppunt · voet licht op de rem', 'info');
+  look(t('decide') + 1.4, t('go') - t('decide') - 1.2, -70, -70, 300, 26, C_LOOK, 'VERKEER', 'traffic');
+  brake.ramp(t('go') - 0.3, t('go') + 0.1, 0);
+  gas.ramp(t('go') - 0.1, t('go') + 0.4, 0.26);
+  clutch.ramp(t('go'), t('go') + 1.4, 0);
+  pop(t('go'), 1.9, 'Nú!', 'Soepel achter de passerende auto de rotonde op', 'ok');
+  indicator(t('ind6'), t('x') + 1.2, 'R');
+  pop(t('ind6'), 1.9, '6. Richtingaanwijzer rechts', 'Na de 1e afslag: je neemt de volgende');
+  step(t('ind6'), 1, 6, 'active'); step(t('bs'), 1, 6, 'done');
+  mirror(t('bs') - 0.6, 0.6, 'R', C_OK);
+  look(t('bs'), 1.1, 115, 140, 220, 30, C_OK, 'VRIJ');
+  SHOULDER.push({ t0: t('bs'), t1: t('bs') + 1.1, col: C_OK });
+  pop(t('bs') - 0.6, 2.2, '7. Dode hoek controle!', 'Rechterspiegel + over de schouder: fietspad vrij', 'ok');
+  step(t('bs') - 0.6, 1, 7, 'active'); step(t('bs') + 1.4, 1, 7, 'done');
+  upshift(t('out') - 0.4, 2, 3);
+  pop(t('out'), 2.2, 'Rotonde verlaten', 'Optrekken en opschakelen naar 3', 'info', 1);
+}
+/* ---- Situatie 2: fietser in de dode hoek ---- */
+{
+  const t = n => T['s2_' + n];
+  brake.ramp(t('decide'), t('decide') + 0.3, 0);
+  gas.ramp(t('decide'), t('decide') + 0.4, 0.2);
+  pop(t('decide'), 1.8, 'Beslissen', 'Rotonde vrij → doorrijden in de 2', 'decide');
+  pop(t('in'), 1.6, '6. Richtingaanwijzer rechts', 'Staat al aan sinds de nadering ✓');
+  step(t('in'), 2, 6, 'done');
+  // 7. dode hoek — fietser!
+  mirror(t('bs') - 0.5, 0.7, 'R', C_RED);
+  look(t('bs'), t('wait_end') - t('bs') - 1.0, 125, 125, 240, 30, C_RED, 'FIETSER!', 'bike');
+  SHOULDER.push({ t0: t('bs'), t1: t('wait_end') - 1.0, col: C_RED });
+  pop(t('bs') - 0.5, t('stop') - t('bs') + 0.5, '7. Dode hoek controle!', 'Fietser op het fietspad gaat rechtdoor → voorrang!', 'danger');
+  step(t('bs') - 0.5, 2, 7, 'active');
+  gas.ramp(t('bs') - 0.4, t('bs'), 0);
+  brake.ramp(t('bs'), t('bs') + 1.0, 0.35);
+  brake.ramp(t('stop') - 1.4, t('stop'), 0.6);
+  clutch.ramp(t('bs') + 0.6, t('bs') + 1.2, 1);
+  pop(t('stop'), t('wait_end') - t('stop') - 1.0, 'Wachten', 'Rustig stoppen vóór zebrapad en fietspad · koppeling in', 'warn', 0);
+  shift(t('stop') + 0.4, 2, 1, 0.7);
+  look(t('wait_end') - 1.0, 1.4, 120, 140, 240, 30, C_OK, 'VRIJ');
+  SHOULDER.push({ t0: t('wait_end') - 1.0, t1: t('wait_end') + 0.4, col: C_OK });
+  pop(t('wait_end') - 1.0, 2.4, 'Vrij!', 'Fietser is gepasseerd — soepel optrekken', 'ok');
+  step(t('wait_end') - 0.6, 2, 7, 'done');
+  brake.ramp(t('wait_end') - 0.3, t('wait_end'), 0);
+  gas.ramp(t('wait_end') - 0.2, t('wait_end') + 0.4, 0.3);
+  clutch.ramp(t('wait_end'), t('wait_end') + 0.6, 0.55);
+  clutch.ramp(t('wait_end') + 0.6, t('wait_end') + 1.5, 0);
+  setIndEnd('R', t('wait_end') + 1.6);
+  upshift(t('wait_end') + 2.3, 1, 2);
+  upshift(t('out') + 0.6, 2, 3);
+}
+/* ---- Situatie 3: rustig, linksaf ---- */
+{
+  const t = n => T['s3_' + n];
+  brake.ramp(t('decide'), t('decide') + 0.3, 0);
+  gas.ramp(t('decide'), t('decide') + 0.4, 0.22);
+  pop(t('decide'), 1.9, 'Beslissen', 'Geen verkeer → in één vloeiende beweging de rotonde op', 'decide');
+  pop(t('in'), 2.2, 'Binnenste lijn', 'Ruime, vloeiende bocht in z\'n 2', 'info', 1);
+  setIndEnd('L', t('ind6'));
+  indicator(t('ind6'), t('x') + 1.2, 'R');
+  pop(t('ind6'), 1.9, '6. Richtingaanwijzer rechts', 'Na de 2e afslag: je neemt de volgende');
+  step(t('ind6'), 3, 6, 'active'); step(t('bs'), 3, 6, 'done');
+  mirror(t('bs') - 0.6, 0.6, 'R', C_OK);
+  look(t('bs'), 1.1, 115, 140, 220, 30, C_OK, 'LEEG');
+  SHOULDER.push({ t0: t('bs'), t1: t('bs') + 1.1, col: C_OK });
+  pop(t('bs') - 0.6, 2.2, '7. Dode hoek controle!', 'Fietspad helemaal leeg ✓', 'ok');
+  step(t('bs') - 0.6, 3, 7, 'active'); step(t('bs') + 1.4, 3, 7, 'done');
+  upshift(t('out') - 0.2, 2, 3, 0.4);
+  upshift(t('cruise') + 0.5, 3, 4, 0.3);
+  pop(t('out'), 2.2, 'Uitversnellen', 'Soepel mee met het overige verkeer', 'info', 1);
+}
+const FINAL_T = T.s3_cruise + 2.2;
+SHIFTS.sort((a, b) => a.t0 - b.t0);
+
+function gearAt(t) {
+  let g = 3;
+  for (const s of SHIFTS) { if (t >= s.t1) g = s.g1; else if (t >= s.t0) return { g: 'N', from: s.g0, to: s.g1, f: (t - s.t0) / (s.t1 - s.t0) }; }
+  return { g, from: g, to: g, f: 1 };
+}
+// H-patroon: positie van de pookknop
+const GPOS = { 1: [-1, -1], 2: [-1, 1], 3: [0, -1], 4: [0, 1], 5: [1, -1], R: [1, 1] };
+function leverPos(t) {
+  const G = gearAt(t);
+  if (G.g !== 'N') return { x: GPOS[G.g][0], y: GPOS[G.g][1] };
+  const a = GPOS[G.from], b = GPOS[G.to], f = G.f;
+  if (f < 0.35) { const k = ss(f / 0.35); return { x: a[0], y: lerp(a[1], 0, k) }; }
+  if (f < 0.6) { const k = ss((f - 0.35) / 0.25); return { x: lerp(a[0], b[0], k), y: 0 }; }
+  const k = ss((f - 0.6) / 0.4); return { x: b[0], y: lerp(0, b[1], k) };
+}
+function indAt(t) { for (const e of IND) if (t >= e.t0 && t < e.t1) return e.dir; return null; }
+const blinkOn = t => (t * 1.6) % 1 < 0.55;
+
+/* ---------- Overige weggebruikers ---------- */
+const V_TRAF = 40;
+const trafConf = trafPath.nearest(C1.x + RMID * Math.cos(1.25), C1.y + RMID * Math.sin(1.25));
+const TRAF = [];
+[-0.7, -2.4, -4.1, -5.8, -7.6, 5.6, 8.4].forEach((d, i) => TRAF.push({ path: trafPath, tc: T.s1_go + d, sc: trafConf, v: V_TRAF, col: ['#e04f5f', '#f2f2f2', '#3a3f4b', '#7fb3d5', '#e9a23b', '#8e5ac8', '#5c9e5a'][i] }));
+const traf2Conf = trafPath2.nearest(C1.x + RMID * Math.cos(-2.3), C1.y + RMID * Math.sin(-2.3));
+TRAF.push({ path: trafPath2, tc: T.s1_zone + 0.5, sc: traf2Conf, v: V_TRAF, col: '#c9c9c9', ind: 'R' });
+TRAF.push({ path: trafPath2, tc: T.s1_zone + 3.0, sc: traf2Conf, v: V_TRAF, col: '#d65a31', ind: 'R' });
+function trafPose(c, t) {
+  const s = c.sc + c.v * (t - c.tc);
+  if (s < 0 || s > c.path.len) return null;
+  return c.path.pose(s);
+}
+const bikeConf = bikePath.nearest(C2.x + RC, C2.y);
+const BIKE = { tc: T.s2_wait + 1.6, v: 30 };
+function bikePose(t) { const s = bikeConf + BIKE.v * (t - BIKE.tc); if (s < 0 || s > bikePath.len) return null; return bikePath.pose(s); }
+// voorligger op de laatste weg
+function leadPose(t) { if (t < T.s3_in) return null; const s = M.r3X + 760 + 62 * (t - T.s3_in); return route.pose(s); }
+const PEDS = [
+  { C: C1, arm: S_, side: -1, ph: 0 }, { C: C1, arm: E_, side: 1, ph: 1 }, { C: C2, arm: N_, side: 1, ph: 2 },
+  { C: C3, arm: S_, side: -1, ph: 3 }, { C: C2, arm: W_, side: -1, ph: 4 },
+];
+
+/* ============================================================
+   TEKENEN — wereld
+   ============================================================ */
+const COL = { grass: '#86b56c', grass2: '#7aa862', road: '#4b4f58', bike: '#b8573f', walk: '#c9c3b6', island: '#6ea35a', curb: '#d8d8d8', line: '#f4f4f4' };
+function rr(c, x, y, w, h, r) { c.beginPath(); c.roundRect ? c.roundRect(x, y, w, h, r) : c.rect(x, y, w, h); }
+
+function drawArms(c, fn) {
+  for (const ra of RAS) for (const [phi, len] of ra.arms) { c.save(); c.translate(ra.C.x, ra.C.y); c.rotate(phi); fn(c, len, ra, phi); c.restore(); }
+}
+function drawStatic(c, view) {
+  // gras met velden
+  c.fillStyle = COL.grass; c.fillRect(view.x0, view.y0, view.x1 - view.x0, view.y1 - view.y0);
+  // fietspaden langs de wegen
+  drawArms(c, (c, len) => { c.fillStyle = COL.bike; c.fillRect(RC, -55, len - RC, 14); c.fillRect(RC, 41, len - RC, 14); });
+  // fietsring
+  for (const ra of RAS) {
+    c.beginPath(); c.arc(ra.C.x, ra.C.y, RC, 0, TAU); c.strokeStyle = COL.bike; c.lineWidth = 16; c.stroke();
+    c.beginPath(); c.arc(ra.C.x, ra.C.y, RC + 18, 0, TAU); c.strokeStyle = COL.walk; c.lineWidth = 7; c.stroke();
+  }
+  // wegen
+  drawArms(c, (c, len) => {
+    c.fillStyle = COL.curb; c.fillRect(RO - 12, -24, len - RO + 12, 48);
+    c.fillStyle = COL.road; c.fillRect(RO - 12, -22, len - RO + 12, 44);
+    c.fillStyle = COL.line; c.fillRect(RO + 30, -20.5, len - RO - 30, 1.2); c.fillRect(RO + 30, 19.3, len - RO - 30, 1.2);
+    for (let x = D_ZONE + 20; x < len; x += 26) c.fillRect(x, -0.7, 13, 1.4);
+  });
+  for (const ra of RAS) {
+    const { x, y } = ra.C;
+    c.beginPath(); c.arc(x, y, RO + 3, 0, TAU); c.fillStyle = COL.curb; c.fill();
+    c.beginPath(); c.arc(x, y, RO + 1, 0, TAU); c.fillStyle = COL.road; c.fill();
+  }
+  drawArms(c, (c) => { c.fillStyle = COL.road; c.fillRect(RO - 14, -22, 30, 44); });
+  // oversteken: fietspad, zebrapad, haaientanden, middengeleider
+  drawArms(c, (c) => {
+    c.fillStyle = COL.bike; c.fillRect(RC - 8, -22, 16, 44);
+    c.fillStyle = COL.line;
+    for (let yy = -21; yy < 21; yy += 5) { c.fillRect(RC - 8.5, yy, 2, 2.4); c.fillRect(RC + 6.5, yy, 2, 2.4); }
+    for (let yy = -20; yy < 20; yy += 5.6) c.fillRect(D_ZEBRA0, yy, D_ZEBRA1 - D_ZEBRA0, 3);
+    teeth(c, RO + 1); teeth(c, D_TEETH);
+    c.fillStyle = '#a3a7ad'; c.strokeStyle = COL.line; c.lineWidth = 1;
+    for (const [a, b] of [[RO + 4, D_ZEBRA0 - 2], [D_ZEBRA1 + 2, RC - 11], [RC + 11, RC + 42]]) { rr(c, a, -3.5, b - a, 7, 3.5); c.fill(); c.stroke(); }
+  });
+  // middeneiland
+  for (const ra of RAS) {
+    const { x, y } = ra.C;
+    c.beginPath(); c.arc(x, y, RI + 9, 0, TAU); c.fillStyle = '#9b958a'; c.fill();
+    c.beginPath(); c.arc(x, y, RI + 9, 0, TAU); c.setLineDash([3, 3]); c.strokeStyle = '#bdb6aa'; c.lineWidth = 2; c.stroke(); c.setLineDash([]);
+    c.beginPath(); c.arc(x, y, RI, 0, TAU); c.fillStyle = COL.island; c.fill(); c.strokeStyle = COL.curb; c.lineWidth = 2; c.stroke();
+    for (let i = 0; i < 7; i++) { const a = i / 7 * TAU; c.beginPath(); c.arc(x + Math.cos(a) * 34, y + Math.sin(a) * 34, 8, 0, TAU); c.fillStyle = i % 2 ? '#e0b23a' : '#d0573f'; c.fill(); }
+    c.beginPath(); c.arc(x, y, 18, 0, TAU); c.fillStyle = '#3f7d3a'; c.fill();
+    c.beginPath(); c.arc(x - 4, y - 4, 10, 0, TAU); c.fillStyle = '#58a04e'; c.fill();
+  }
+  // huizen
+  for (const h of HOUSES) {
+    if (h.x < view.x0 - 80 || h.x > view.x1 + 80 || h.y < view.y0 - 80 || h.y > view.y1 + 80) continue;
+    c.save(); c.translate(h.x, h.y); c.rotate(h.a);
+    c.fillStyle = 'rgba(0,0,0,.18)'; c.fillRect(-h.w / 2 + 5, -h.h / 2 + 5, h.w, h.h);
+    c.fillStyle = ['#b45a46', '#8c4a3c', '#5e6470', '#a86b4c'][Math.floor(h.c * 4)]; c.fillRect(-h.w / 2, -h.h / 2, h.w, h.h);
+    c.fillStyle = 'rgba(255,255,255,.12)'; c.fillRect(-h.w / 2, -h.h / 2, h.w, h.h / 2);
+    c.strokeStyle = 'rgba(0,0,0,.25)'; c.lineWidth = 1; c.beginPath(); c.moveTo(-h.w / 2, 0); c.lineTo(h.w / 2, 0); c.stroke();
+    c.restore();
+  }
+  // bomen
+  for (const tr of TREES) {
+    if (tr.x < view.x0 - 30 || tr.x > view.x1 + 30 || tr.y < view.y0 - 30 || tr.y > view.y1 + 30) continue;
+    c.beginPath(); c.arc(tr.x + 4, tr.y + 5, tr.r, 0, TAU); c.fillStyle = 'rgba(0,0,0,.18)'; c.fill();
+    c.beginPath(); c.arc(tr.x, tr.y, tr.r, 0, TAU); c.fillStyle = tr.h < .5 ? '#3f7f3c' : '#4c8f3f'; c.fill();
+    c.beginPath(); c.arc(tr.x - tr.r * .3, tr.y - tr.r * .3, tr.r * .55, 0, TAU); c.fillStyle = 'rgba(255,255,255,.12)'; c.fill();
+  }
+}
+function teeth(c, x0) { c.fillStyle = COL.line; for (let i = 0; i < 4; i++) { const y = -20 + i * 5; c.beginPath(); c.moveTo(x0, y); c.lineTo(x0, y + 4.2); c.lineTo(x0 + 7, y + 2.1); c.closePath(); c.fill(); } }
+
+function drawZone(c, t) {
+  for (const z of active(ZONES, t)) {
+    const a = fadeOf(z, t, 0.8, 0.8), on = t >= z.tz, pulse = on ? 0.5 + 0.5 * Math.sin(t * 6) : 0;
+    c.save(); c.translate(z.C.x, z.C.y); c.rotate(z.arm); c.globalAlpha = a;
+    c.fillStyle = `rgba(255,200,40,${0.16 + (on ? 0.14 + pulse * 0.12 : 0)})`; c.fillRect(D_TEETH, -21, D_ZONE - D_TEETH, 21);
+    c.setLineDash([5, 4]); c.strokeStyle = '#ffc828'; c.lineWidth = 1.6; c.strokeRect(D_TEETH, -21, D_ZONE - D_TEETH, 21); c.setLineDash([]);
+    // maatlijn
+    c.strokeStyle = '#fff'; c.lineWidth = 1.2; c.beginPath(); c.moveTo(D_TEETH, -30); c.lineTo(D_ZONE, -30);
+    c.moveTo(D_TEETH, -34); c.lineTo(D_TEETH, -26); c.moveTo(D_ZONE, -34); c.lineTo(D_ZONE, -26); c.stroke();
+    c.restore();
+    // label (schermrecht)
+    const u = armU(z.arm), o = inOff(u), mid = (D_TEETH + D_ZONE) / 2;
+    const px = z.C.x + u.x * mid + o.x * 92, py = z.C.y + u.y * mid + o.y * 92;
+    c.save(); c.globalAlpha = a; c.font = '700 11px Segoe UI, sans-serif'; c.textAlign = 'center'; c.textBaseline = 'middle';
+    const tw = c.measureText('~ 10 meter').width + 10; rr(c, px - tw / 2, py - 8, tw, 16, 8); c.fillStyle = 'rgba(20,20,20,.75)'; c.fill();
+    c.fillStyle = '#ffc828'; c.fillText('~ 10 meter', px, py);
+    c.restore();
+  }
+}
+
+/* ---------- Voertuigen ---------- */
+function drawCar(c, x, y, a, o) {
+  const L = 26, Wd = 11.5;
+  c.save(); c.translate(x, y); c.rotate(a);
+  c.fillStyle = 'rgba(0,0,0,.28)'; rr(c, -L / 2 + 2, -Wd / 2 + 2.5, L, Wd, 3.5); c.fill();
+  if (o.brake > 0.08) { const g = c.createRadialGradient(-L / 2, 0, 1, -L / 2, 0, 16); g.addColorStop(0, `rgba(255,40,40,${0.55 * Math.min(1, o.brake * 2)})`); g.addColorStop(1, 'rgba(255,40,40,0)'); c.fillStyle = g; c.fillRect(-L / 2 - 16, -16, 18, 32); }
+  c.fillStyle = o.col; rr(c, -L / 2, -Wd / 2, L, Wd, 3.5); c.fill();
+  c.strokeStyle = 'rgba(0,0,0,.35)'; c.lineWidth = 0.8; c.stroke();
+  c.fillStyle = '#1d2733'; rr(c, 3, -Wd / 2 + 1.3, 5.2, Wd - 2.6, 1.6); c.fill();          // voorruit
+  c.fillStyle = '#26313e'; rr(c, -10.5, -Wd / 2 + 1.6, 3.6, Wd - 3.2, 1.4); c.fill();     // achterruit
+  c.fillStyle = 'rgba(255,255,255,.18)'; rr(c, -6.6, -Wd / 2 + 1.6, 9.4, Wd - 3.2, 1.6); c.fill(); // dak
+  c.fillStyle = '#fff6c8'; c.fillRect(L / 2 - 1.4, -Wd / 2 + 1, 1.4, 2.2); c.fillRect(L / 2 - 1.4, Wd / 2 - 3.2, 1.4, 2.2);
+  c.fillStyle = o.brake > 0.08 ? '#ff3030' : '#8a1d1d'; c.fillRect(-L / 2, -Wd / 2 + 1, 1.3, 2.2); c.fillRect(-L / 2, Wd / 2 - 3.2, 1.3, 2.2);
+  c.fillStyle = 'rgba(0,0,0,.6)'; c.fillRect(5, -Wd / 2 - 1.4, 1.6, 1.6); c.fillRect(5, Wd / 2 - 0.2, 1.6, 1.6); // spiegels
+  if (o.les) { rr(c, -4.8, -3.3, 6.4, 6.6, 1.2); c.fillStyle = '#ffffff'; c.fill(); c.fillStyle = '#d0021b'; c.font = '700 5px Segoe UI, sans-serif'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.save(); c.rotate(PI / 2); c.fillText('LES', 0, 1.6); c.restore(); }
+  if (o.ind && o.blink) {
+    const sy = o.ind === 'R' ? 1 : -1;
+    for (const xx of [L / 2 - 1, -L / 2 + 1]) { const g = c.createRadialGradient(xx, sy * Wd / 2, 0, xx, sy * Wd / 2, 7); g.addColorStop(0, 'rgba(255,170,0,1)'); g.addColorStop(1, 'rgba(255,170,0,0)'); c.fillStyle = g; c.beginPath(); c.arc(xx, sy * Wd / 2, 7, 0, TAU); c.fill(); }
+  }
+  c.restore();
+}
+function drawBike(c, p, t) {
+  c.save(); c.translate(p.x, p.y); c.beginPath(); c.arc(0, 0, 11, 0, TAU); c.fillStyle = 'rgba(255,255,255,.28)'; c.fill(); c.rotate(p.a); c.scale(1.45, 1.45);
+  c.fillStyle = 'rgba(0,0,0,.25)'; c.fillRect(-5, -1, 12, 4);
+  c.strokeStyle = '#222'; c.lineWidth = 1.6; c.beginPath(); c.moveTo(-6, 0); c.lineTo(6, 0); c.stroke();
+  c.fillStyle = '#ffd400'; rr(c, -3.5, -3, 5, 6, 2); c.fill(); c.strokeStyle = '#222'; c.lineWidth = 0.6; c.stroke();
+  const k = Math.sin(t * 9) * 1.4; c.fillStyle = '#2b2b2b'; c.fillRect(-1 + k, -3.6, 2, 1.4); c.fillRect(-1 - k, 2.2, 2, 1.4);
+  c.beginPath(); c.arc(0.5, 0, 2.3, 0, TAU); c.fillStyle = '#f3c89b'; c.fill();
+  c.beginPath(); c.arc(0.2, 0, 2.4, PI * 0.6, PI * 1.4); c.fillStyle = '#333'; c.fill();
+  c.restore();
+}
+function drawPed(c, ped, t) {
+  const u = armU(ped.arm), o = { x: -u.y, y: u.x }, d = (D_ZEBRA0 + D_ZEBRA1) / 2, side = ped.side * 31;
+  const x = ped.C.x + u.x * d + o.x * side, y = ped.C.y + u.y * d + o.y * side, b = Math.sin(t * 2 + ped.ph) * 0.6;
+  c.beginPath(); c.arc(x + 1.5, y + 1.5, 3.4, 0, TAU); c.fillStyle = 'rgba(0,0,0,.2)'; c.fill();
+  c.beginPath(); c.arc(x, y + b, 3.4, 0, TAU); c.fillStyle = ['#3b6fd8', '#c94a8b', '#2f8f6b', '#d98c2b', '#6a4fc9'][ped.ph]; c.fill();
+  c.beginPath(); c.arc(x, y + b, 1.9, 0, TAU); c.fillStyle = '#f0c9a0'; c.fill();
+}
+
+/* ---------- Kijk-kegels ---------- */
+function relAngle(from, to, a) { let r = Math.atan2(to.y - from.y, to.x - from.x) - a; while (r > PI) r -= TAU; while (r < -PI) r += TAU; return r; }
+function nearestTrafficLeft(car, t) {
+  let best = null, bd = 1e9;
+  for (const tc of TRAF) { const p = trafPose(tc, t); if (!p) continue; const r = relAngle(car, p, car.a); if (r > -0.2) continue; const d = Math.hypot(p.x - car.x, p.y - car.y); if (d < bd && d < 260) { bd = d; best = p; } }
+  return best;
+}
+function drawCones(c, car, t) {
+  const dx = car.x + Math.cos(car.a) * 4 - Math.sin(car.a) * -2.5, dy = car.y + Math.sin(car.a) * 4 + Math.cos(car.a) * -2.5;
+  const origin = { x: dx, y: dy };
+  const list = [{ ang: 0, len: 190, w: 18 * DEG, col: '#ffffff', alpha: 0.10 }];
+  for (const e of active(LOOKS, t)) {
+    let ang = lerp(e.a0, e.a1, ss((t - e.t0) / (e.t1 - e.t0)));
+    if (e.track === 'bike') { const p = bikePose(t); if (p) ang = relAngle(origin, p, car.a); }
+    if (e.track === 'traffic') { const p = nearestTrafficLeft(car, t); if (p) ang = relAngle(origin, p, car.a); }
+    list.push({ ang, len: e.len, w: e.w, col: e.col, alpha: 0.55 * fadeOf(e, t, 0.15, 0.2), label: e.label });
+  }
+  c.save(); c.globalCompositeOperation = 'lighter';
+  for (const k of list) {
+    const A = car.a + k.ang, g = c.createRadialGradient(dx, dy, 2, dx, dy, k.len);
+    g.addColorStop(0, hexA(k.col, k.alpha)); g.addColorStop(0.7, hexA(k.col, k.alpha * 0.35)); g.addColorStop(1, hexA(k.col, 0));
+    c.fillStyle = g; c.beginPath(); c.moveTo(dx, dy); c.arc(dx, dy, k.len, A - k.w, A + k.w); c.closePath(); c.fill();
+  }
+  c.restore();
+  for (const k of list) {
+    if (!k.label || k.alpha < 0.1) continue;
+    const A = car.a + k.ang, lx = dx + Math.cos(A) * Math.min(k.len * 0.55, 120), ly = dy + Math.sin(A) * Math.min(k.len * 0.55, 120);
+    c.save(); c.globalAlpha = Math.min(1, k.alpha * 2); c.font = '800 10px Segoe UI, sans-serif'; c.textAlign = 'center'; c.textBaseline = 'middle';
+    const tw = c.measureText(k.label).width + 10; rr(c, lx - tw / 2, ly - 7.5, tw, 15, 7.5); c.fillStyle = k.col; c.fill();
+    c.fillStyle = '#111'; c.fillText(k.label, lx, ly); c.restore();
+  }
+}
+function hexA(hex, a) { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16 & 255},${n >> 8 & 255},${n & 255},${clamp(a, 0, 1)})`; }
+
+/* ---------- Dynamische wereld (verkeer, eigen auto) ---------- */
+function drawDynamic(c, t, car, st, opts = {}) {
+  drawZone(c, t);
+  for (const p of PEDS) drawPed(c, p, t);
+  const bp = bikePose(t); if (bp) drawBike(c, bp, t);
+  for (const tc of TRAF) { const p = trafPose(tc, t); if (p) drawCar(c, p.x, p.y, p.a, { col: tc.col, ind: tc.ind, blink: blinkOn(t + 0.3) }); }
+  const lp = leadPose(t); if (lp) drawCar(c, lp.x, lp.y, lp.a, { col: '#d8d8d8' });
+  if (!opts.noCones) drawCones(c, car, t);
+  drawCar(c, car.x, car.y, car.a, { col: '#2f6fed', les: true, brake: st.brake, ind: st.ind, blink: st.blink });
+}
+
+/* ============================================================
+   INZETVENSTERS — spiegels, pedalen, handen
+   ============================================================ */
+const PANEL = { x: MAINW, w: W - MAINW };
+function panelFrame(c, y, h, title, sub) {
+  c.fillStyle = '#121620'; c.fillRect(PANEL.x, y, PANEL.w, h);
+  c.fillStyle = '#1a1f2b'; c.fillRect(PANEL.x, y, PANEL.w, 30);
+  c.fillStyle = '#2a3142'; c.fillRect(PANEL.x, y + h - 1, PANEL.w, 1); c.fillRect(PANEL.x, y, 1, h);
+  c.font = '700 13px Segoe UI, sans-serif'; c.textAlign = 'left'; c.textBaseline = 'middle'; c.fillStyle = '#e8ecf3';
+  c.fillText(title, PANEL.x + 14, y + 15);
+  c.font = '12px Segoe UI, sans-serif'; c.fillStyle = '#8a93a6'; c.textAlign = 'right'; c.fillText(sub, W - 14, y + 15);
+}
+
+/* ---------- Spiegels ---------- */
+function mirrorView(c, t, car, kind, bx, by, bw, bh, label) {
+  const ev = active(MIRR, t).find(e => e.m === kind);
+  const hl = ev ? fadeOf(ev, t, 0.12, 0.2) : 0;
+  c.save();
+  rr(c, bx, by, bw, bh, kind === 'C' ? 10 : 18); c.fillStyle = '#0b0d12'; c.fill();
+  c.lineWidth = 4 + hl * 3; c.strokeStyle = hl > 0 ? hexA(ev.col, 0.4 + 0.6 * hl) : '#3a4152'; c.stroke();
+  if (hl > 0) { c.shadowColor = ev.col; c.shadowBlur = 22 * hl; c.stroke(); c.shadowBlur = 0; }
+  rr(c, bx + 4, by + 4, bw - 8, bh - 8, kind === 'C' ? 7 : 14); c.clip();
+  const h = { x: Math.cos(car.a), y: Math.sin(car.a) }, lft = { x: h.y, y: -h.x };
+  const side = kind === 'L' ? 1 : kind === 'R' ? -1 : 0;
+  const f = { x: car.x - h.x * 70 + lft.x * side * 26, y: car.y - h.y * 70 + lft.y * side * 26 };
+  const z = 1.25;
+  c.translate(bx + bw / 2, by + bh / 2 + (kind === 'C' ? 0 : 8)); c.scale(-z, z); c.rotate(PI / 2 - car.a); c.translate(-f.x, -f.y);
+  const R = 170; drawStatic(c, { x0: f.x - R, y0: f.y - R, x1: f.x + R, y1: f.y + R });
+  drawDynamic(c, t, car, carState(t), { noCones: true });
+  c.restore();
+  // glans
+  c.save(); rr(c, bx + 4, by + 4, bw - 8, bh - 8, 12); c.clip();
+  const g = c.createLinearGradient(bx, by, bx + bw, by + bh); g.addColorStop(0, 'rgba(255,255,255,.10)'); g.addColorStop(0.4, 'rgba(255,255,255,0)'); c.fillStyle = g; c.fillRect(bx, by, bw, bh);
+  c.restore();
+  c.font = '600 11px Segoe UI, sans-serif'; c.textAlign = 'center'; c.textBaseline = 'top';
+  c.fillStyle = hl > 0 ? ev.col : '#8a93a6'; c.fillText(label, bx + bw / 2, by + bh + 6);
+}
+function drawMirrors(c, t, car) {
+  panelFrame(c, 0, 300, 'Spiegels & kijken', 'achteruitkijken');
+  mirrorView(c, t, car, 'C', PANEL.x + 160, 44, 180, 70, 'Binnenspiegel');
+  mirrorView(c, t, car, 'L', PANEL.x + 20, 140, 150, 104, 'Linker buitenspiegel');
+  mirrorView(c, t, car, 'R', PANEL.x + 330, 140, 150, 104, 'Rechter buitenspiegel');
+  // schouderblik
+  const sh = active(SHOULDER, t)[0], k = sh ? fadeOf(sh, t, 0.25, 0.3) : 0;
+  const cx = PANEL.x + 250, cy = 200;
+  c.save(); c.translate(cx, cy);
+  c.beginPath(); c.ellipse(0, 10, 34, 14, 0, 0, TAU); c.fillStyle = '#2b3242'; c.fill();
+  c.rotate(k * 1.9);
+  c.beginPath(); c.arc(0, 0, 15, 0, TAU); c.fillStyle = '#e2b68c'; c.fill();
+  c.beginPath(); c.arc(0, 2, 15, PI * 0.15, PI * 0.85); c.fillStyle = '#4a3426'; c.fill();
+  c.beginPath(); c.moveTo(-5, -14); c.lineTo(0, -20); c.lineTo(5, -14); c.fillStyle = '#d9a77c'; c.fill();
+  if (k > 0) { c.globalCompositeOperation = 'lighter'; const g = c.createRadialGradient(0, -16, 2, 0, -16, 70); g.addColorStop(0, hexA(sh.col, 0.6 * k)); g.addColorStop(1, hexA(sh.col, 0)); c.fillStyle = g; c.beginPath(); c.moveTo(0, -16); c.arc(0, -16, 70, -PI / 2 - 0.4, -PI / 2 + 0.4); c.fill(); }
+  c.restore();
+  c.font = '600 11px Segoe UI, sans-serif'; c.textAlign = 'center'; c.fillStyle = k > 0 ? sh.col : '#8a93a6';
+  c.fillText(k > 0 ? 'Over de schouder!' : 'Schouderblik', cx, 252);
+  c.font = '11px Segoe UI, sans-serif'; c.fillStyle = '#5d667a'; c.fillText('(dode hoek)', cx, 266);
+}
+
+/* ---------- Pedalen ---------- */
+function drawPedals(c, t, st) {
+  const y0 = 300; panelFrame(c, y0, 300, 'Voeten op de pedalen', 'K · R · G');
+  const peds = [
+    { n: 'Koppeling', v: st.clutch, x: PANEL.x + 120, col: '#4dd2ff', bite: true },
+    { n: 'Rem', v: st.brake, x: PANEL.x + 270, col: '#ff5a5a' },
+    { n: 'Gas', v: st.gas, x: PANEL.x + 395, col: '#3ddc84', narrow: true },
+  ];
+  // vloer
+  const g = c.createLinearGradient(0, y0 + 30, 0, y0 + 300); g.addColorStop(0, '#171b25'); g.addColorStop(1, '#0d1017'); c.fillStyle = g; c.fillRect(PANEL.x + 1, y0 + 30, PANEL.w - 1, 269);
+  c.fillStyle = '#1e2330'; rr(c, PANEL.x + 18, y0 + 150, 44, 90, 6); c.fill(); // voetsteun
+  for (const p of peds) {
+    const w = p.narrow ? 48 : 84, h = p.narrow ? 110 : 74, top = y0 + 92 + p.v * 46, sc = 1 - p.v * 0.08;
+    // meter
+    const mx = p.x + w / 2 + 16, my = y0 + 70, mh = 150;
+    rr(c, mx, my, 9, mh, 4.5); c.fillStyle = '#232938'; c.fill();
+    rr(c, mx, my + mh * (1 - p.v), 9, mh * p.v, 4.5); c.fillStyle = p.col; c.fill();
+    if (p.bite) { const by = my + mh * (1 - 0.55); c.fillStyle = '#ffd34d'; c.fillRect(mx - 4, by - 1, 17, 2); }
+    // arm + pedaal
+    c.strokeStyle = '#3a4152'; c.lineWidth = 6; c.beginPath(); c.moveTo(p.x, y0 + 40); c.lineTo(p.x, top + 10); c.stroke();
+    c.save(); c.translate(p.x, top + h / 2); c.scale(sc, sc);
+    rr(c, -w / 2, -h / 2, w, h, 8); c.fillStyle = '#2c3345'; c.fill(); c.lineWidth = 2; c.strokeStyle = hexA(p.col, 0.25 + p.v * 0.75); c.stroke();
+    c.fillStyle = '#20263300'; for (let i = -h / 2 + 10; i < h / 2 - 6; i += 9) { c.fillStyle = '#394155'; c.fillRect(-w / 2 + 8, i, w - 16, 3); }
+    c.restore();
+    c.font = '700 12px Segoe UI, sans-serif'; c.textAlign = 'center'; c.textBaseline = 'top'; c.fillStyle = p.v > 0.05 ? p.col : '#8a93a6';
+    c.fillText(p.n, p.x, y0 + 262);
+    c.font = '11px Segoe UI, sans-serif'; c.fillStyle = '#5d667a'; c.fillText(Math.round(p.v * 100) + '%', p.x, y0 + 278);
+  }
+  // linkervoet: voetsteun ↔ koppeling
+  const kl = ss(st.clutch * 6 + (st.clutchSoon ? 1 : 0));
+  foot(c, lerp(PANEL.x + 40, peds[0].x, kl), y0 + 160 + kl * (st.clutch * 46 - 20), st.clutch, '#3d4a66');
+  // rechtervoet: rem ↔ gas
+  const kr = ss((st.brake - st.gas) * 8 + 0.5);
+  const fx = lerp(peds[2].x, peds[1].x, kr), press = Math.max(st.brake, st.gas);
+  foot(c, fx, y0 + 150 + press * 46 - 14, press, '#3d4a66');
+  // aangrijppunt-label
+  if (st.clutch > 0.4 && st.clutch < 0.7) {
+    c.font = '700 11px Segoe UI, sans-serif'; c.textAlign = 'left'; c.fillStyle = '#ffd34d';
+    c.fillText('◀ aangrijppunt', peds[0].x + 72, y0 + 70 + 150 * 0.45 - 6);
+  }
+}
+function foot(c, x, y, press, col) {
+  c.save(); c.translate(x, y); c.scale(1 - press * 0.06, 1 - press * 0.06);
+  c.fillStyle = 'rgba(0,0,0,.35)'; c.beginPath(); c.ellipse(4, 6, 27, 44, 0, 0, TAU); c.fill();
+  const g = c.createLinearGradient(0, -50, 0, 50); g.addColorStop(0, '#59647f'); g.addColorStop(1, col); c.fillStyle = g;
+  c.beginPath(); c.ellipse(0, 0, 25, 42, 0, 0, TAU); c.fill();
+  c.fillStyle = '#e9e9e9'; c.beginPath(); c.ellipse(0, -28, 17, 12, 0, 0, TAU); c.fill(); // neus schoen
+  c.fillStyle = '#2b3245'; c.fillRect(-14, 22, 28, 6);
+  c.restore();
+}
+
+/* ---------- Handen: stuur, richtingaanwijzer, pook ---------- */
+function drawHands(c, t, st) {
+  const y0 = 600; panelFrame(c, y0, 300, 'Handen: stuur · richtingaanwijzer · pook', 'versnelling ' + st.gearLabel);
+  const cx = PANEL.x + 175, cy = y0 + 170, R = 92;
+  // richtingaanwijzer-hendel (links achter het stuur)
+  const ind = st.ind, stalkA = ind === 'R' ? 0.32 : ind === 'L' ? -0.32 : 0;
+  c.save(); c.translate(cx - 30, cy - 4); c.rotate(PI + stalkA);
+  rr(c, 0, -5, 112, 10, 5); c.fillStyle = '#2f3647'; c.fill(); c.fillStyle = ind ? '#ffb020' : '#4a5266'; c.fillRect(96, -5, 16, 10);
+  c.restore();
+  // stuur
+  c.save(); c.translate(cx, cy); c.rotate(st.wheel);
+  c.beginPath(); c.arc(0, 0, R, 0, TAU); c.lineWidth = 15; c.strokeStyle = '#262c39'; c.stroke();
+  c.beginPath(); c.arc(0, 0, R, -PI / 2 - 0.12, -PI / 2 + 0.12); c.strokeStyle = '#ffb020'; c.stroke();
+  c.lineWidth = 12; c.strokeStyle = '#2d3443';
+  for (const a of [PI / 2, PI * 0.08, PI * 0.92]) { c.beginPath(); c.moveTo(0, 0); c.lineTo(Math.cos(a) * R, Math.sin(a) * R); c.stroke(); }
+  c.beginPath(); c.arc(0, 0, 28, 0, TAU); c.fillStyle = '#333b4d'; c.fill();
+  // handen op het stuur
+  const leftOnStalk = st.handToStalk;
+  if (!leftOnStalk) hand(c, Math.cos(PI * 1.15) * R, Math.sin(PI * 1.15) * R, PI * 1.15);
+  if (!st.handOnLever) hand(c, Math.cos(-PI * 0.15) * R, Math.sin(-PI * 0.15) * R, -PI * 0.15);
+  c.restore();
+  if (leftOnStalk) hand(c, cx - 30 - Math.cos(stalkA) * 90, cy - 4 - Math.sin(stalkA) * 90, PI);
+  // pijltjes
+  const blink = st.blink;
+  arrow(c, cx - 26, y0 + 52, -1, ind === 'L' && blink); arrow(c, cx + 26, y0 + 52, 1, ind === 'R' && blink);
+  c.font = '600 11px Segoe UI, sans-serif'; c.textAlign = 'center'; c.fillStyle = ind ? '#3ddc84' : '#5d667a';
+  c.fillText(ind === 'R' ? 'rechts' : ind === 'L' ? 'links' : 'richtingaanwijzer uit', cx, y0 + 285);
+  // pook (H-patroon)
+  const gx = PANEL.x + 400, gy = y0 + 160, sx = 30, sy = 46;
+  c.strokeStyle = '#2c3343'; c.lineWidth = 7; c.lineCap = 'round';
+  c.beginPath(); c.moveTo(gx - sx, gy); c.lineTo(gx + sx, gy);
+  for (const k of [-1, 0, 1]) { c.moveTo(gx + k * sx, gy - sy); c.lineTo(gx + k * sx, gy + sy); } c.stroke(); c.lineCap = 'butt';
+  c.font = '700 13px Segoe UI, sans-serif'; c.textBaseline = 'middle';
+  for (const [g, p] of Object.entries(GPOS)) { c.fillStyle = String(st.gear) === g ? '#ffb020' : '#5d667a'; c.fillText(g, gx + p[0] * sx, gy + p[1] * (sy + 15)); }
+  const lp = leverPos(t), kx = gx + lp.x * sx, ky = gy + lp.y * sy;
+  c.beginPath(); c.arc(kx + 2, ky + 3, 16, 0, TAU); c.fillStyle = 'rgba(0,0,0,.35)'; c.fill();
+  const gg = c.createRadialGradient(kx - 5, ky - 5, 2, kx, ky, 16); gg.addColorStop(0, '#58627a'); gg.addColorStop(1, '#262c3a');
+  c.beginPath(); c.arc(kx, ky, 15, 0, TAU); c.fillStyle = gg; c.fill();
+  if (st.handOnLever) hand(c, kx + 6, ky + 4, -0.3, 1.1);
+  c.fillStyle = '#8a93a6'; c.font = '600 11px Segoe UI, sans-serif'; c.textBaseline = 'alphabetic';
+  c.fillText('pook', gx, y0 + 285);
+}
+function hand(c, x, y, a, s = 1) {
+  c.save(); c.translate(x, y); c.rotate(a); c.scale(s, s);
+  c.fillStyle = 'rgba(0,0,0,.3)'; c.beginPath(); c.ellipse(3, 3, 17, 13, 0, 0, TAU); c.fill();
+  c.fillStyle = '#e2b68c'; c.beginPath(); c.ellipse(0, 0, 16, 12, 0, 0, TAU); c.fill();
+  c.fillStyle = '#d29f74'; for (let i = -1; i <= 2; i++) { c.beginPath(); c.ellipse(9, i * 5 - 2, 6, 2.6, 0.2, 0, TAU); c.fill(); }
+  c.restore();
+}
+function arrow(c, x, y, dir, on) {
+  c.save(); c.translate(x, y); c.scale(dir, 1);
+  c.beginPath(); c.moveTo(-8, -6); c.lineTo(2, -6); c.lineTo(2, -12); c.lineTo(14, 0); c.lineTo(2, 12); c.lineTo(2, 6); c.lineTo(-8, 6); c.closePath();
+  c.fillStyle = on ? '#3ddc84' : '#2a3142'; if (on) { c.shadowColor = '#3ddc84'; c.shadowBlur = 14; } c.fill();
+  c.restore();
+}
+
+/* ============================================================
+   TOESTAND + OVERLAYS
+   ============================================================ */
+for (const S of SITS) { step(T[S.p + '_zone'], S.n, 'Z', 'active'); step(T[S.p + '_decide'] + 1.0, S.n, 'Z', 'done'); }
+STEPS.sort((a, b) => a.t - b.t);
+
+function carState(t) {
+  const sv = carSV(t), p = route.pose(sv.s), ind = indAt(t), G = gearAt(t);
+  const e = IND.find(e => t >= e.t0 && t < e.t1);
+  const kap = (route.curv(sv.s) + route.curv(sv.s + 10)) / 2;
+  return {
+    s: sv.s, v: sv.v, car: { x: p.x, y: p.y, a: p.a },
+    gas: gas.at(t), brake: brake.at(t), clutch: clutch.at(t),
+    ind, blink: !!(e && blinkOn(t - e.t0)), gear: G.g, gearLabel: G.g === 'N' ? 'N → ' + G.to : String(G.g),
+    wheel: clamp(kap * 84 * 1.5, -2.4, 2.4),
+    handOnLever: HANDS.some(h => t >= h.t0 && t < h.t1),
+    handToStalk: IND.some(e => (t >= e.t0 - 0.35 && t < e.t0 + 0.4) || (e.t1 < 1e8 && t >= e.t1 - 0.35 && t < e.t1 + 0.4)),
+  };
+}
+function sitAt(t) { let s = SITS[0]; for (const S of SITS) if (t >= T[S.p + '_start'] - 1.2) s = S; return s; }
+
+const STEP_ROWS = [
+  ['1', 'Kijkpatroon'], ['2', 'Richtingaanwijzer'], ['3', 'Remmen (gas los)'], ['4', 'Schakelen → 2'], ['5', 'Koppeling omhoog'],
+  ['Z', '~10 m: kijken & beslissen'], ['6', 'Richtingaanwijzer rechts'], ['7', 'Dode hoek controle!'],
+];
+function drawChecklist(c, t) {
+  const S = sitAt(t), x = 16, y = 74, w = 252, rh = 27;
+  rr(c, x, y, w, 44 + STEP_ROWS.length * rh, 12); c.fillStyle = 'rgba(14,17,23,.82)'; c.fill();
+  c.font = '700 12px Segoe UI, sans-serif'; c.textAlign = 'left'; c.textBaseline = 'middle'; c.fillStyle = '#8a93a6';
+  c.fillText('STAPPENPLAN', x + 14, y + 20);
+  STEP_ROWS.forEach(([n, label], i) => {
+    let state = 'pending';
+    for (const e of STEPS) if (e.sit === S.n && String(e.n) === n && e.t <= t) state = e.state;
+    const ry = y + 42 + i * rh, cx = x + 26;
+    if (state === 'active') { rr(c, x + 6, ry - 12, w - 12, 24, 8); c.fillStyle = 'rgba(255,200,40,.14)'; c.fill(); }
+    c.beginPath(); c.arc(cx, ry, 10, 0, TAU);
+    c.fillStyle = state === 'done' ? '#3ddc84' : state === 'active' ? '#ffc828' : state === 'skip' ? '#3a4152' : '#232938'; c.fill();
+    if (state === 'active') { c.strokeStyle = hexA('#ffc828', 0.4 + 0.4 * Math.sin(t * 8)); c.lineWidth = 3; c.stroke(); }
+    c.font = '800 11px Segoe UI, sans-serif'; c.textAlign = 'center'; c.fillStyle = state === 'pending' ? '#8a93a6' : '#10131a';
+    c.fillText(state === 'done' ? '✓' : n === 'Z' ? '!' : n, cx, ry + 0.5);
+    c.textAlign = 'left'; c.font = (state === 'active' ? '700 ' : '500 ') + '13px Segoe UI, sans-serif';
+    c.fillStyle = state === 'active' ? '#fff' : state === 'done' ? '#c6f3d8' : state === 'skip' ? '#5d667a' : '#8a93a6';
+    c.fillText(label + (state === 'skip' ? '  (n.v.t.)' : ''), x + 44, ry + 0.5);
+    if (state === 'skip') { const tw = c.measureText(label).width; c.fillRect(x + 44, ry, tw, 1.2); }
+  });
+}
+function drawSitChip(c, t) {
+  const S = sitAt(t), txt = S.title + ' · ' + S.sub;
+  c.font = '700 13px Segoe UI, sans-serif'; const tw = c.measureText(txt).width + 28;
+  rr(c, 16, 16, tw, 40, 10); c.fillStyle = 'rgba(14,17,23,.82)'; c.fill();
+  c.fillStyle = '#ffb020'; rr(c, 16, 16, 5, 40, 2); c.fill();
+  c.textAlign = 'left'; c.textBaseline = 'middle'; c.fillStyle = '#fff'; c.fillText(txt, 30, 30);
+  c.font = '11px Segoe UI, sans-serif'; c.fillStyle = '#8a93a6'; c.fillText(S.theme, 30, 46);
+}
+function drawBanner(c, t) {
+  for (const b of active(BANNERS, t)) {
+    const a = fadeOf(b, t, 0.5, 0.5), k = easeOutBack((t - b.t0) / 0.6);
+    c.save(); c.globalAlpha = a; c.translate(MAINW / 2, H * 0.42); c.scale(0.85 + 0.15 * k, 0.85 + 0.15 * k);
+    rr(c, -300, -80, 600, 160, 18); c.fillStyle = 'rgba(14,17,23,.9)'; c.fill(); c.strokeStyle = '#ffb020'; c.lineWidth = 2; c.stroke();
+    c.textAlign = 'center'; c.textBaseline = 'middle';
+    c.font = '800 16px Segoe UI, sans-serif'; c.fillStyle = '#ffb020'; c.fillText(b.S.title.toUpperCase() + '  ·  ' + b.S.theme.toUpperCase(), 0, -38);
+    c.font = '800 30px Segoe UI, sans-serif'; c.fillStyle = '#fff'; c.fillText(b.S.sub, 0, 4);
+    c.font = '14px Segoe UI, sans-serif'; c.fillStyle = '#a8b0c2'; c.fillText('Voorbereiden · kijken in de 10-meter zone · veilig verlaten', 0, 44);
+    c.restore();
+  }
+}
+const POP_STYLE = {
+  step: ['#ffc828', '#1b1f2a'], skip: ['#8a93a6', '#1b1f2a'], key: ['#ff9f1c', '#2a1d08'], look: ['#ffd34d', '#1b1f2a'],
+  decide: ['#b48cff', '#1d1730'], ok: ['#3ddc84', '#0f2419'], danger: ['#ff4d4d', '#2c0f12'], warn: ['#ff9f1c', '#2a1d08'], info: ['#4dd2ff', '#0f1d26'],
+};
+function drawPops(c, t) {
+  for (const p of active(POPS, t)) {
+    const a = fadeOf(p, t, 0.2, 0.3), k = easeOutBack((t - p.t0) / 0.4), [acc, bg] = POP_STYLE[p.kind] || POP_STYLE.step;
+    const big = p.slot === 0, y = big ? 92 : 172;
+    const m = /^(\d)\.\s(.*)$/.exec(p.title), num = m ? m[1] : null, title = m ? m[2] : p.title;
+    c.save(); c.globalAlpha = a; c.translate(MAINW / 2 + 130, y); c.scale(0.8 + 0.2 * k, 0.8 + 0.2 * k);
+    c.font = (big ? '800 26px ' : '800 19px ') + 'Segoe UI, sans-serif'; const tw1 = c.measureText(title).width;
+    c.font = (big ? '15px ' : '13px ') + 'Segoe UI, sans-serif'; const tw2 = p.sub ? c.measureText(p.sub).width : 0;
+    const badge = num ? (big ? 44 : 34) : 0, w = Math.max(tw1 + badge, tw2) + 44, h = big ? (p.sub ? 78 : 54) : (p.sub ? 62 : 42);
+    if (p.kind === 'danger' && Math.sin(t * 14) > 0) { c.shadowColor = acc; c.shadowBlur = 30; }
+    rr(c, -w / 2, -h / 2, w, h, 14); c.fillStyle = hexA(bg, 0.94); c.fill(); c.shadowBlur = 0;
+    c.lineWidth = 2; c.strokeStyle = acc; c.stroke();
+    c.textBaseline = 'middle'; c.textAlign = 'left';
+    const ty = p.sub ? -h / 2 + (big ? 26 : 21) : 0; let tx = -(tw1 + badge) / 2;
+    if (num) { c.beginPath(); c.arc(tx + badge / 2 - 4, ty, badge / 2 - 6, 0, TAU); c.fillStyle = acc; c.fill(); c.fillStyle = '#111'; c.font = '800 ' + (big ? 20 : 15) + 'px Segoe UI, sans-serif'; c.textAlign = 'center'; c.fillText(num, tx + badge / 2 - 4, ty + 1); c.textAlign = 'left'; tx += badge; }
+    c.font = (big ? '800 26px ' : '800 19px ') + 'Segoe UI, sans-serif'; c.fillStyle = p.kind === 'skip' ? '#a8b0c2' : '#fff'; c.fillText(title, tx, ty);
+    if (p.sub) { c.textAlign = 'center'; c.font = (big ? '15px ' : '13px ') + 'Segoe UI, sans-serif'; c.fillStyle = acc; c.fillText(p.sub, 0, h / 2 - (big ? 20 : 16)); }
+    c.restore();
+  }
+}
+function drawSpeedo(c, st) {
+  const x = 120, y = H - 70, r = 78, kmh = KMH(st.v), max = 80;
+  rr(c, 16, H - 176, 330, 160, 14); c.fillStyle = 'rgba(14,17,23,.85)'; c.fill();
+  c.lineWidth = 9; c.lineCap = 'round';
+  c.beginPath(); c.arc(x, y, r, PI, TAU); c.strokeStyle = '#232938'; c.stroke();
+  c.beginPath(); c.arc(x, y, r, PI, PI + PI * clamp(kmh / max, 0, 1)); c.strokeStyle = kmh > 30 ? '#4dd2ff' : '#3ddc84'; c.stroke(); c.lineCap = 'butt';
+  c.font = '10px Segoe UI, sans-serif'; c.fillStyle = '#5d667a'; c.textAlign = 'center'; c.textBaseline = 'middle';
+  for (let v = 0; v <= max; v += 20) { const a = PI + PI * v / max; c.fillText(v, x + Math.cos(a) * (r - 20), y + Math.sin(a) * (r - 20)); }
+  const na = PI + PI * clamp(kmh / max, 0, 1);
+  c.strokeStyle = '#ff6b4a'; c.lineWidth = 3; c.beginPath(); c.moveTo(x, y); c.lineTo(x + Math.cos(na) * (r - 6), y + Math.sin(na) * (r - 6)); c.stroke();
+  c.beginPath(); c.arc(x, y, 6, 0, TAU); c.fillStyle = '#ff6b4a'; c.fill();
+  c.font = '800 26px Segoe UI, sans-serif'; c.fillStyle = '#fff'; c.textAlign = 'left'; c.fillText(Math.round(kmh), x + r + 30, y - 46);
+  c.font = '12px Segoe UI, sans-serif'; c.fillStyle = '#8a93a6'; c.fillText('km/u', x + r + 30, y - 24);
+  c.font = '12px Segoe UI, sans-serif'; c.fillText('versnelling', x + r + 30, y + 2);
+  c.font = '800 26px Segoe UI, sans-serif'; c.fillStyle = st.gear === 'N' ? '#ffd34d' : '#ffb020'; c.fillText(st.gear, x + r + 30, y - 0 + 0 + 0 + 26 - 26 + 22);
+  // richtingaanwijzer-lampjes
+  arrow(c, x - 18, y - 30, -1, st.ind === 'L' && st.blink); arrow(c, x + 18, y - 30, 1, st.ind === 'R' && st.blink);
+}
+
+/* ---------- 'Wat als?' flashback ---------- */
+function drawWhatIf(c, G) {
+  const w = G - FREEZE.t; if (w < 0 || w > FREEZE.d) return;
+  const a = Math.min(ss(w / 0.4), ss((FREEZE.d - w) / 0.5));
+  c.save(); c.globalAlpha = a;
+  c.fillStyle = 'rgba(8,10,14,.62)'; c.fillRect(0, 0, MAINW, H);
+  const bx = 70, by = 150, bw = 960, bh = 600;
+  rr(c, bx, by, bw, bh, 18); c.fillStyle = '#10141c'; c.fill(); c.lineWidth = 3; c.strokeStyle = '#ff4d4d'; c.stroke();
+  c.font = '800 15px Segoe UI, sans-serif'; c.textAlign = 'left'; c.textBaseline = 'middle'; c.fillStyle = '#ff4d4d';
+  c.fillText('⚠  WAT ALS…?', bx + 24, by + 30);
+  c.font = '13px Segoe UI, sans-serif'; c.fillStyle = '#8a93a6'; c.fillText('Even terugspoelen — zo gaat het mis', bx + 140, by + 31);
+  // mini-scène
+  const sx = bx + 30, sy = by + 60, sc = 1.75;
+  c.save(); rr(c, sx, sy, 300 * sc, 300 * sc, 12); c.clip(); c.translate(sx, sy); c.scale(sc, sc);
+  c.fillStyle = COL.grass; c.fillRect(0, 0, 300, 300);
+  c.fillStyle = COL.road; c.fillRect(128, 0, 44, 300); c.fillStyle = COL.road; c.beginPath(); c.arc(150, -70, 100, 0, TAU); c.fill();
+  c.fillStyle = COL.bike; c.fillRect(0, 52, 300, 16);
+  c.fillStyle = COL.line; for (let x = 128; x < 172; x += 5) { c.fillRect(x, 51, 2.4, 2); c.fillRect(x, 67, 2.4, 2); }
+  c.save(); c.translate(150, 0); c.rotate(PI / 2); teeth(c, 72); c.restore();
+  c.fillStyle = 'rgba(255,77,77,.2)'; c.fillRect(150, 72, 22, 60); c.setLineDash([4, 3]); c.strokeStyle = '#ff4d4d'; c.strokeRect(150, 72, 22, 60); c.setLineDash([]);
+  c.font = '700 8px Segoe UI, sans-serif'; c.fillStyle = '#fff'; c.textAlign = 'right'; c.fillText('~10 m', 146, 102);
+  // auto
+  const tn = 3.35, v0 = 52; let y, stopped = false;
+  if (w < tn) y = 280 - v0 * w; else { const u = Math.min(w - tn, 0.45); y = 280 - v0 * tn - (v0 * u - 0.5 * (v0 / 0.45) * u * u); stopped = w > tn + 0.45; }
+  if (w > tn) { c.fillStyle = 'rgba(20,20,20,.55)'; c.fillRect(155, y + 6, 2, Math.min(40, (w - tn) * 90)); c.fillRect(165, y + 6, 2, Math.min(40, (w - tn) * 90)); }
+  // kijk-kegel: omlaag naar de pook (fout) / daarna geschrokken vooruit
+  const looking = w > 1.6 && w < tn;
+  const cone = looking ? { a: PI / 2 + 0.3, col: '#ff4d4d' } : { a: -PI / 2, col: w >= tn ? '#ff4d4d' : '#ffd34d' };
+  c.save(); c.globalCompositeOperation = 'lighter'; const g = c.createRadialGradient(158, y - 4, 1, 158, y - 4, looking ? 26 : 90);
+  g.addColorStop(0, hexA(cone.col, 0.5)); g.addColorStop(1, hexA(cone.col, 0)); c.fillStyle = g;
+  c.beginPath(); c.moveTo(158, y - 4); c.arc(158, y - 4, looking ? 26 : 90, cone.a - 0.35, cone.a + 0.35); c.fill(); c.restore();
+  drawCar(c, 160.5, y, -PI / 2, { col: '#c0392b', brake: w >= tn ? 1 : 0 });
+  if (looking) { c.font = '800 9px Segoe UI, sans-serif'; c.textAlign = 'left'; c.fillStyle = '#ffd34d'; c.fillText('schakelen… 3→2?!', 178, y + 2 + Math.sin(w * 30) * 1); }
+  // fietser
+  const bxp = 322 - 45 * w; if (bxp > -20) drawBike(c, { x: bxp, y: 58, a: PI }, w);
+  if (w >= tn && w < tn + 1.6) { c.font = '900 22px Segoe UI, sans-serif'; c.textAlign = 'center'; c.fillStyle = Math.sin(w * 18) > 0 ? '#ff4d4d' : '#fff'; c.fillText('NOODSTOP!', 150, 200); }
+  c.restore();
+  // uitleg
+  const tx = sx + 300 * sc + 30, lines = [
+    [0.4, '#e8ecf3', '1. Te laat begonnen met remmen en schakelen'],
+    [1.6, '#ffd34d', '2. In de 10-meter zone nog aan het schakelen…'],
+    [2.4, '#ffd34d', '3. Ogen op de pook in plaats van op de weg'],
+    [3.35, '#ff4d4d', '4. Fietser te laat gezien → abrupte noodstop!'],
+    [4.6, '#3ddc84', '✓ Les: klaar met bediening vóór de 10 meter.'],
+    [5.2, '#3ddc84', '✓ In de zone alleen nog: kijken en beslissen.'],
+  ];
+  c.textAlign = 'left'; c.textBaseline = 'top';
+  lines.forEach(([t0, col, txt], i) => {
+    const k = ss((w - t0) / 0.35); if (k <= 0) return;
+    c.globalAlpha = a * k; c.font = (i >= 4 ? '700 ' : '600 ') + '17px Segoe UI, sans-serif'; c.fillStyle = col;
+    wrapText(c, txt, tx + (1 - k) * 20, sy + 30 + i * 74, bw - (tx - bx) - 30, 22);
+  });
+  c.globalAlpha = a; c.font = '12px Segoe UI, sans-serif'; c.fillStyle = '#5d667a';
+  if (w > 6.4) c.fillText('Terug naar de vloeiende praktijk…', tx, by + bh - 40);
+  c.restore();
+}
+function wrapText(c, txt, x, y, maxW, lh) {
+  const words = txt.split(' '); let line = '';
+  for (const wd of words) { const tst = line ? line + ' ' + wd : wd; if (c.measureText(tst).width > maxW && line) { c.fillText(line, x, y); line = wd; y += lh; } else line = tst; }
+  c.fillText(line, x, y);
+}
+
+/* ---------- Eindshot ---------- */
+function drawFinal(c, t) {
+  if (t < FINAL_T) return;
+  const k = ss((t - FINAL_T) / 0.8), s = easeOutBack((t - FINAL_T - 0.2) / 0.7);
+  c.save(); c.fillStyle = `rgba(8,10,14,${0.5 * k})`; c.fillRect(0, 0, W, H);
+  const r = rng(99);
+  for (let i = 0; i < 140; i++) {
+    const x0 = r() * W, sp = 60 + r() * 120, ph = r() * TAU, col = ['#ffb020', '#3ddc84', '#4dd2ff', '#ff4d4d', '#b48cff', '#fff'][i % 6];
+    const tt = t - FINAL_T, y = -20 + ((tt * sp + r() * H) % (H + 40)), x = x0 + Math.sin(tt * 2 + ph) * 30;
+    c.save(); c.globalAlpha = k; c.translate(x, y); c.rotate(tt * 3 + ph); c.fillStyle = col; c.fillRect(-4, -2, 8, 4); c.restore();
+  }
+  c.translate(W / 2, H / 2 - 20); c.scale(Math.max(0.01, s), Math.max(0.01, s)); c.globalAlpha = k;
+  rr(c, -380, -120, 760, 240, 26); c.fillStyle = 'rgba(14,17,23,.92)'; c.fill(); c.lineWidth = 4; c.strokeStyle = '#ffb020'; c.stroke();
+  c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.font = '900 64px Segoe UI, sans-serif'; const g = c.createLinearGradient(-300, 0, 300, 0); g.addColorStop(0, '#ffd34d'); g.addColorStop(1, '#ff9f1c'); c.fillStyle = g;
+  c.fillText('Perfect Gereden!', 0, -30);
+  c.font = '18px Segoe UI, sans-serif'; c.fillStyle = '#c6cbd6';
+  c.fillText('Kijkpatroon · richtingaanwijzer · remmen · schakelen · koppeling omhoog', 0, 30);
+  c.fillText('→ klaar met bediening vóór de 10 meter → kijken · beslissen · dode hoek', 0, 60);
+  c.font = '28px Segoe UI, sans-serif'; c.fillText('★ ★ ★', 0, 96);
+  c.restore();
+}
+
+/* ============================================================
+   RENDER-LUS & BEDIENING
+   ============================================================ */
+function render(G) {
+  const t = simT(G), st = carState(t), frozen = G > FREEZE.t && G < FREEZE.t + FREEZE.d;
+  ctx.setTransform(cv.width / W, 0, 0, cv.height / H, 0, 0);
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  // hoofdbeeld (vogelvlucht)
+  const ahead = route.pt(st.s + 110), cam = { x: lerp(st.car.x, ahead.x, 0.65), y: lerp(st.car.y, ahead.y, 0.65) };
+  const Z = lerp(1.6, 1.15, ss((t - FINAL_T + 1) / 3));
+  ctx.save(); ctx.beginPath(); ctx.rect(0, 0, MAINW, H); ctx.clip();
+  if (frozen && 'filter' in ctx) ctx.filter = 'grayscale(0.85) brightness(0.8)';
+  ctx.translate(MAINW / 2, H * 0.52); ctx.scale(Z, Z); ctx.translate(-cam.x, -cam.y);
+  const hw = MAINW / 2 / Z + 60, hh = H / 2 / Z + 60;
+  drawStatic(ctx, { x0: cam.x - hw, y0: cam.y - hh, x1: cam.x + hw, y1: cam.y + hh });
+  drawDynamic(ctx, t, st.car, st);
+  ctx.restore(); ctx.filter = 'none';
+  const vg = ctx.createRadialGradient(MAINW / 2, H / 2, H * 0.35, MAINW / 2, H / 2, H * 0.85);
+  vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,.35)'); ctx.fillStyle = vg; ctx.fillRect(0, 0, MAINW, H);
+  drawSitChip(ctx, t); drawChecklist(ctx, t); drawSpeedo(ctx, st);
+  if (!frozen) { drawPops(ctx, t); drawBanner(ctx, t); }
+  // inzetvensters
+  drawMirrors(ctx, t, st.car); drawPedals(ctx, t, st); drawHands(ctx, t, st);
+  drawWhatIf(ctx, G);
+  drawFinal(ctx, t);
+}
+
+const $ = id => document.getElementById(id);
+let G = 0, playing = true, rate = 1, last = performance.now();
+const fmt = s => Math.floor(s / 60) + ':' + String(Math.floor(s % 60)).padStart(2, '0');
+function setPlaying(p) { playing = p; $('play').textContent = p ? '⏸ Pauze' : '▶ Afspelen'; }
+$('play').onclick = () => { if (!playing && G >= TOTAL) G = 0; setPlaying(!playing); };
+$('restart').onclick = () => { G = 0; setPlaying(true); };
+$('rate').onchange = e => rate = +e.target.value;
+$('scrub').oninput = e => { G = e.target.value / 1000 * TOTAL; };
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') { e.preventDefault(); $('play').click(); }
+  if (e.code === 'ArrowRight') G = Math.min(TOTAL, G + 3);
+  if (e.code === 'ArrowLeft') G = Math.max(0, G - 3);
+});
+const CHAPTERS = [
+  ['Situatie 1 · rechtdoor', 0], ['Situatie 2 · rechtsaf', realT(T.s2_start - 1.2)],
+  ['Situatie 3 · linksaf', realT(T.s3_start - 1.2)], ['Wat als?', FREEZE.t - 0.3], ['Eindshot', realT(FINAL_T - 3)],
+];
+for (const [n, g] of CHAPTERS) { const b = document.createElement('button'); b.textContent = n; b.onclick = () => { G = g; setPlaying(true); }; $('chapters').appendChild(b); }
+
+function resize() {
+  const r = cv.getBoundingClientRect(), d = Math.min(2, window.devicePixelRatio || 1);
+  cv.width = Math.max(320, Math.round(r.width * d)); cv.height = Math.max(180, Math.round(r.height * d));
+}
+window.addEventListener('resize', resize); resize();
+function frame(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  if (playing) { G += dt * rate; if (G >= TOTAL) { G = TOTAL; setPlaying(false); } }
+  render(G);
+  $('scrub').value = Math.round(G / TOTAL * 1000);
+  $('time').textContent = fmt(G) + ' / ' + fmt(TOTAL);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
